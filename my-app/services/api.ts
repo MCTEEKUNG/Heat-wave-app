@@ -1,111 +1,155 @@
 // ==============================
-// Heatwave AI — API Client Service
+// Heat Wave — API Service
+// Synced with NewHeart Flask API (localhost:5000)
 // Auto-detects live backend, falls back to mock data
 // ==============================
 
-import type { PredictionResponse, ForecastResponse, ForecastDay } from '@/types/heatwave';
+import type { HeatZone, HeatZoneCollection } from '@/types';
 
-// Use your machine's local IP if testing on device, or localhost for web
+/** Flask API base URL — matches api_server.py in NewHeart */
 const API_BASE_URL = 'http://localhost:5000';
-// const API_BASE_URL = 'http://192.168.1.101:5000'; // Example for physical device
-const TIMEOUT_MS = 30000; // 30s — NASA POWER fetch can be slow
+const TIMEOUT_MS = 30000; // 30s for ConvLSTM inference
 
-// ─── Mock Data ───────────────────────────────────────────────────
+// ─── Data Transformation ─────────────────────────────────────────
 
-const MOCK_PREDICTION: PredictionResponse = {
-    status: 'ok',
-    date: new Date().toISOString().split('T')[0],
-    probability: 0.42,
-    risk_level: 'MEDIUM',
-    advice: 'Moderate heatwave risk. Monitor conditions.',
-    model_type: 'lstm',
-    weather: {
-        T2M: 31.2,
-        T2M_MAX: 36.8,
-        T2M_MIN: 26.4,
-        PRECTOTCORR: 2.1,
-        WS10M: 1.8,
-        RH2M: 68.5,
-        PS: 101.2,
-        NDVI: 0.38,
-        temp_range: 10.4,
-        heat_index_approx: 34.7,
-    },
-    anomaly: {
-        is_anomaly: false,
-        severity: 'none',
-        n_triggers: 0,
-        triggers: [],
-    },
-    bbox: {
-        north: 13.7788,
-        south: 13.7338,
-        east: 100.5243,
-        west: 100.4793,
-    },
-};
+/**
+ * Map the Flask API's integer risk_level (0-3) to our severity strings.
+ *   0 → low, 1 → medium, 2 → high, 3 → critical
+ */
+function riskIntToSeverity(risk: number): HeatZone['properties']['severity'] {
+    if (risk >= 3) return 'critical';
+    if (risk >= 2) return 'high';
+    if (risk >= 1) return 'medium';
+    return 'low';
+}
 
-function generateMockForecast(): ForecastResponse {
-    const days: ForecastDay[] = [];
-    const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-    const baseDate = new Date();
+/**
+ * Map temperature to a probability value (0–1) for display.
+ *   <30°C → 0.1–0.3     30-35°C → 0.3–0.5
+ *   35-38°C → 0.5–0.7    38-41°C → 0.7–0.9    >41°C → 0.9–1.0
+ */
+function tempToProbability(temp: number): number {
+    if (temp >= 41) return Math.min(1.0, 0.9 + (temp - 41) * 0.02);
+    if (temp >= 38) return 0.7 + ((temp - 38) / 3) * 0.2;
+    if (temp >= 35) return 0.5 + ((temp - 35) / 3) * 0.2;
+    if (temp >= 30) return 0.3 + ((temp - 30) / 5) * 0.2;
+    return Math.max(0.05, 0.1 + (temp / 30) * 0.2);
+}
 
-    for (let i = 0; i < 7; i++) {
-        const d = new Date(baseDate);
-        d.setDate(d.getDate() + i + 1);
-        const prob = Math.min(0.12 + 0.11 * i + Math.random() * 0.08, 1.0);
-        const risk = prob < 0.4 ? 'LOW' : prob < 0.6 ? 'MEDIUM' : prob < 0.8 ? 'HIGH' : 'CRITICAL';
+/**
+ * Transform the Flask /api/map FeatureCollection into our HeatZone[] format.
+ * The API returns individual grid cells — we pass them through directly,
+ * adding the fields our UI expects (name, probability, severity, confidence).
+ */
+function transformApiFeatures(features: Array<{
+    type: string;
+    geometry: { type: string; coordinates: number[][][] };
+    properties: { temperature: number; risk_level: number };
+}>): HeatZone[] {
+    return features.map((f, i) => {
+        const temp = f.properties.temperature;
+        const riskInt = f.properties.risk_level;
+        const severity = riskIntToSeverity(riskInt);
+        const probability = tempToProbability(temp);
 
-        days.push({
-            day: i + 1,
-            date: d.toISOString().split('T')[0],
-            day_name: dayNames[d.getDay() === 0 ? 6 : d.getDay() - 1],
-            probability: Math.round(prob * 1000) / 1000,
-            risk_level: `${risk}`,
-            risk_label: risk as any,
-            advice: '',
-            weather: {
-                T2M_MAX: 33 + i * 0.6 + Math.random() * 1.5,
-                T2M_MIN: 24 + i * 0.3 + Math.random() * 0.8,
-                T2M: 28 + i * 0.4 + Math.random(),
-                PRECTOTCORR: Math.max(0, 5 - i * 0.8 + Math.random() * 2),
-                WS10M: 1.5 + i * 0.2 + Math.random() * 0.5,
-                RH2M: 75 - i * 2.5 + Math.random() * 3,
-                NDVI: 0.35 + Math.random() * 0.1,
+        // Generate a name from the grid cell position
+        const coords = f.geometry.coordinates[0];
+        const centerLat = coords.reduce((s, c) => s + c[1], 0) / coords.length;
+        const centerLon = coords.reduce((s, c) => s + c[0], 0) / coords.length;
+
+        return {
+            id: `grid-${i}`,
+            type: 'Feature' as const,
+            geometry: {
+                type: 'Polygon' as const,
+                coordinates: f.geometry.coordinates,
             },
-        });
-    }
+            properties: {
+                name: `Zone ${centerLat.toFixed(2)}°N, ${centerLon.toFixed(2)}°E`,
+                probability,
+                severity,
+                temperature: temp,
+                confidence: probability > 0.7 ? 0.9 : 0.75, // Higher confidence for extreme temps
+                lastUpdate: new Date().toISOString(),
+            },
+        };
+    });
+}
 
-    return {
-        status: 'ok',
-        model_type: 'lstm',
-        days: 7,
-        generated_at: new Date().toISOString(),
-        forecasts: days,
-    };
+// ─── Mock Heat Zones: Bangkok & Chiang Mai (OFFLINE fallback) ────
+
+function generateMockZones(dayOffset: number = 0): HeatZone[] {
+    const seed = dayOffset * 0.15;
+
+    const zones: HeatZone[] = [
+        // ── Bangkok Region ──
+        {
+            id: 'bkk-central',
+            type: 'Feature',
+            geometry: { type: 'Polygon', coordinates: [[[100.48, 13.72], [100.54, 13.72], [100.54, 13.78], [100.48, 13.78], [100.48, 13.72]]] },
+            properties: { name: 'Bangkok Central', probability: Math.min(1, 0.85 + seed * 0.05), severity: 'critical', temperature: 42 + dayOffset * 0.3, confidence: 0.92, lastUpdate: new Date().toISOString() },
+        },
+        {
+            id: 'bkk-north',
+            type: 'Feature',
+            geometry: { type: 'Polygon', coordinates: [[[100.46, 13.82], [100.56, 13.82], [100.56, 13.90], [100.46, 13.90], [100.46, 13.82]]] },
+            properties: { name: 'Bangkok North (Don Mueang)', probability: Math.min(1, 0.65 + seed * 0.08), severity: 'high', temperature: 39 + dayOffset * 0.2, confidence: 0.87, lastUpdate: new Date().toISOString() },
+        },
+        {
+            id: 'bkk-east',
+            type: 'Feature',
+            geometry: { type: 'Polygon', coordinates: [[[100.58, 13.70], [100.68, 13.70], [100.68, 13.80], [100.58, 13.80], [100.58, 13.70]]] },
+            properties: { name: 'Bangkok East (Bangkapi)', probability: Math.min(1, 0.52 + seed * 0.06), severity: 'medium', temperature: 37 + dayOffset * 0.25, confidence: 0.81, lastUpdate: new Date().toISOString() },
+        },
+        {
+            id: 'bkk-thonburi',
+            type: 'Feature',
+            geometry: { type: 'Polygon', coordinates: [[[100.38, 13.70], [100.47, 13.70], [100.47, 13.78], [100.38, 13.78], [100.38, 13.70]]] },
+            properties: { name: 'Thonburi', probability: Math.min(1, 0.45 + seed * 0.04), severity: 'medium', temperature: 36 + dayOffset * 0.15, confidence: 0.79, lastUpdate: new Date().toISOString() },
+        },
+        {
+            id: 'bkk-south',
+            type: 'Feature',
+            geometry: { type: 'Polygon', coordinates: [[[100.48, 13.60], [100.58, 13.60], [100.58, 13.70], [100.48, 13.70], [100.48, 13.60]]] },
+            properties: { name: 'Bangkok South (Sathorn)', probability: Math.min(1, 0.30 + seed * 0.03), severity: 'low', temperature: 34 + dayOffset * 0.1, confidence: 0.85, lastUpdate: new Date().toISOString() },
+        },
+        // ── Chiang Mai Region ──
+        {
+            id: 'cm-city',
+            type: 'Feature',
+            geometry: { type: 'Polygon', coordinates: [[[98.94, 18.76], [99.02, 18.76], [99.02, 18.82], [98.94, 18.82], [98.94, 18.76]]] },
+            properties: { name: 'Chiang Mai City', probability: Math.min(1, 0.72 + seed * 0.07), severity: 'high', temperature: 40 + dayOffset * 0.35, confidence: 0.88, lastUpdate: new Date().toISOString() },
+        },
+        {
+            id: 'cm-north',
+            type: 'Feature',
+            geometry: { type: 'Polygon', coordinates: [[[98.92, 18.84], [99.04, 18.84], [99.04, 18.94], [98.92, 18.94], [98.92, 18.84]]] },
+            properties: { name: 'Chiang Mai North (Mae Rim)', probability: Math.min(1, 0.38 + seed * 0.04), severity: 'low', temperature: 35 + dayOffset * 0.2, confidence: 0.76, lastUpdate: new Date().toISOString() },
+        },
+        {
+            id: 'cm-south',
+            type: 'Feature',
+            geometry: { type: 'Polygon', coordinates: [[[98.90, 18.68], [99.00, 18.68], [99.00, 18.76], [98.90, 18.76], [98.90, 18.68]]] },
+            properties: { name: 'Chiang Mai South (Hang Dong)', probability: Math.min(1, 0.55 + seed * 0.05), severity: 'medium', temperature: 38 + dayOffset * 0.15, confidence: 0.82, lastUpdate: new Date().toISOString() },
+        },
+    ];
+
+    // Recalculate severity based on shifted probability
+    return zones.map((z) => {
+        const p = z.properties.probability;
+        let severity: HeatZone['properties']['severity'] = 'low';
+        if (p >= 0.8) severity = 'critical';
+        else if (p >= 0.6) severity = 'high';
+        else if (p >= 0.4) severity = 'medium';
+        return { ...z, properties: { ...z.properties, severity } };
+    });
 }
 
 // ─── API Client ──────────────────────────────────────────────────
 
-/** Force mock mode on/off. null = auto-detect (default) */
-let forceMockMode: boolean | null = null;
-
-/** Cached API availability status */
 let apiAvailable: boolean | null = null;
 
-export function setUseMockData(value: boolean) {
-    forceMockMode = value;
-    apiAvailable = value ? false : null; // reset detection when toggling to live
-}
-
-export function getUseMockData(): boolean {
-    if (forceMockMode !== null) return forceMockMode;
-    return apiAvailable === false;
-}
-
-/**
- * Check if the Flask API is reachable. Result is cached.
- */
+/** Check if the Flask API is reachable. Result is cached per session. */
 async function checkApiAvailability(): Promise<boolean> {
     if (apiAvailable !== null) return apiAvailable;
     try {
@@ -113,11 +157,18 @@ async function checkApiAvailability(): Promise<boolean> {
         const timer = setTimeout(() => controller.abort(), 3000);
         const res = await fetch(`${API_BASE_URL}/api/health`, { signal: controller.signal });
         clearTimeout(timer);
-        apiAvailable = res.ok;
+        if (res.ok) {
+            const data = await res.json();
+            apiAvailable = data.status === 'ok' && data.model_loaded === true;
+        } else {
+            apiAvailable = false;
+        }
     } catch {
         apiAvailable = false;
     }
-    console.log(`[Heatwave API] Backend ${apiAvailable ? '✅ CONNECTED' : '❌ OFFLINE (using mock data)'}`);
+    console.log(
+        `[HeatWave API] Backend ${apiAvailable ? '✅ CONNECTED (ConvLSTM model loaded)' : '❌ OFFLINE (using mock data)'}`,
+    );
     return apiAvailable;
 }
 
@@ -125,8 +176,7 @@ async function fetchWithTimeout(url: string, timeoutMs = TIMEOUT_MS): Promise<Re
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-        const res = await fetch(url, { signal: controller.signal });
-        return res;
+        return await fetch(url, { signal: controller.signal });
     } finally {
         clearTimeout(timer);
     }
@@ -134,46 +184,101 @@ async function fetchWithTimeout(url: string, timeoutMs = TIMEOUT_MS): Promise<Re
 
 // ─── Public API ──────────────────────────────────────────────────
 
-export async function fetchPrediction(model?: string): Promise<PredictionResponse> {
-    // Auto-detect backend availability
-    const isLive = forceMockMode === true ? false : await checkApiAvailability();
+/**
+ * Fetch heat zones from the Flask /api/map endpoint.
+ * Returns ConvLSTM-predicted temperature grid as GeoJSON polygons
+ * transformed to our HeatZone format.
+ * Falls back to mock data if the API is unavailable.
+ */
+export async function fetchHeatZones(
+    date?: string,
+    dayOffset: number = 0,
+): Promise<{ zones: HeatZone[]; isLive: boolean }> {
+    const isLive = await checkApiAvailability();
 
     if (!isLive) {
-        await new Promise((r) => setTimeout(r, 400));
-        return { ...MOCK_PREDICTION, date: new Date().toISOString().split('T')[0] };
+        await new Promise((r) => setTimeout(r, 300));
+        return { zones: generateMockZones(dayOffset), isLive: false };
     }
 
     try {
-        const params = model ? `?model=${model}` : '';
-        const res = await fetchWithTimeout(`${API_BASE_URL}/api/predict${params}`);
+        const res = await fetchWithTimeout(`${API_BASE_URL}/api/map`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
         const data = await res.json();
-        if (data.status === 'error') throw new Error(data.message);
-        return data;
+
+        if (data.error) throw new Error(data.error);
+
+        // The API returns { type: "FeatureCollection", features: [...] }
+        const rawFeatures = data.features || [];
+        const zones = transformApiFeatures(rawFeatures);
+
+        return { zones, isLive: true };
     } catch (err) {
-        console.warn('[Heatwave API] Prediction failed, using mock:', err);
-        return { ...MOCK_PREDICTION, date: new Date().toISOString().split('T')[0] };
+        console.warn('[HeatWave API] fetchHeatZones failed, using mock:', err);
+        return { zones: generateMockZones(dayOffset), isLive: false };
     }
 }
 
-export async function fetchForecast(days = 7, model?: string): Promise<ForecastResponse> {
-    const isLive = forceMockMode === true ? false : await checkApiAvailability();
-
-    if (!isLive) {
-        await new Promise((r) => setTimeout(r, 400));
-        return generateMockForecast();
-    }
+/**
+ * Fetch prediction summary from /api/predict.
+ * Returns risk level, probability, weather, and bbox.
+ */
+export async function fetchPrediction(): Promise<{
+    risk_level: string;
+    probability: number;
+    advice: string;
+    weather: Record<string, number | null>;
+    bbox: { north: number; south: number; east: number; west: number };
+} | null> {
+    const isLive = await checkApiAvailability();
+    if (!isLive) return null;
 
     try {
-        const params = new URLSearchParams({ days: String(days) });
-        if (model) params.set('model', model);
-        const res = await fetchWithTimeout(`${API_BASE_URL}/api/forecast?${params}`);
+        const res = await fetchWithTimeout(`${API_BASE_URL}/api/predict`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        if (data.status === 'error') throw new Error(data.message);
+        if (data.error) throw new Error(data.error);
         return data;
     } catch (err) {
-        console.warn('[Heatwave API] Forecast failed, using mock:', err);
-        return generateMockForecast();
+        console.warn('[HeatWave API] fetchPrediction failed:', err);
+        return null;
     }
+}
+
+/**
+ * Fetch 7-day forecast from /api/forecast.
+ */
+export async function fetchForecast(): Promise<{
+    forecasts: Array<{
+        day: number;
+        date: string;
+        risk_level: string;
+        probability: number;
+        weather: Record<string, number | null>;
+    }>;
+} | null> {
+    const isLive = await checkApiAvailability();
+    if (!isLive) return null;
+
+    try {
+        const res = await fetchWithTimeout(`${API_BASE_URL}/api/forecast`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        return data;
+    } catch (err) {
+        console.warn('[HeatWave API] fetchForecast failed:', err);
+        return null;
+    }
+}
+
+/** Reset the API availability cache. */
+export function resetApiCache(): void {
+    apiAvailable = null;
+}
+
+/** Check current API connection status. */
+export function isApiConnected(): boolean {
+    return apiAvailable === true;
 }

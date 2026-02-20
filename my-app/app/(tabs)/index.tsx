@@ -1,251 +1,302 @@
 /**
- * Dashboard Screen — Full-Screen Map with Floating Overlays
- * Map is the hero. Everything else is minimal and floating.
+ * Dashboard Screen — Full-Screen Map with Heat Zone Overlays
+ * • Requests user geolocation on load
+ * • Zooms to user location
+ * • Filters zones to nearby area (solves 2400+ zone lag)
+ * • Auto-displays the closest zone info without clicking
  */
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   ActivityIndicator,
   Platform,
+  useWindowDimensions,
 } from 'react-native';
-import { useColorScheme } from '@/hooks/use-color-scheme';
-import { Colors, RiskColors } from '@/constants/theme';
-import { fetchPrediction, fetchForecast, getUseMockData } from '@/services/api';
-import HeatwaveMap from '@/components/HeatwaveMap';
-import { TimelineBar, type TimelineDay } from '@/components/TimelineBar';
-import type { PredictionResponse, ForecastResponse, RiskLevel, WeatherData } from '@/types/heatwave';
+import HeatMap from '@/components/map/HeatMap';
+import TimeSlider from '@/components/map/TimeSlider';
+import Legend from '@/components/map/Legend';
+import AlertCard from '@/components/ui/AlertCard';
+import { useHeatwaveStore } from '@/store/useHeatwaveStore';
+import { fetchHeatZones } from '@/services/api';
+import type { HeatZone } from '@/types';
 
-interface DayData {
-  riskLevel: RiskLevel;
-  probability: number;
-  advice: string;
-  weather: WeatherData;
-  date: string;
-  bbox: { north: number; south: number; east: number; west: number };
+/** Max distance (degrees) to include zones — ~1° ≈ 111 km */
+const PROXIMITY_RADIUS = 1.5;
+
+/** Calculate distance in degrees between two lat/lon points */
+function degreeDistance(
+  lat1: number, lon1: number,
+  lat2: number, lon2: number,
+): number {
+  const dLat = lat1 - lat2;
+  const dLon = lon1 - lon2;
+  return Math.sqrt(dLat * dLat + dLon * dLon);
 }
 
-const DEFAULT_BBOX = {
-  north: 13.7788,
-  south: 13.7338,
-  east: 100.5243,
-  west: 100.4793,
-};
+/** Get center of a polygon from its coordinates */
+function getPolygonCenter(coords: number[][]): { lat: number; lon: number } {
+  let lat = 0, lon = 0;
+  for (const c of coords) {
+    lon += c[0];
+    lat += c[1];
+  }
+  return { lat: lat / coords.length, lon: lon / coords.length };
+}
 
 export default function DashboardScreen() {
-  const [prediction, setPrediction] = useState<PredictionResponse | null>(null);
-  const [forecast, setForecast] = useState<ForecastResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [selectedDay, setSelectedDay] = useState(0);
-  const colorScheme = useColorScheme() ?? 'light';
-  const theme = Colors[colorScheme];
+  const {
+    zones,
+    nearbyZones,
+    selectedZone,
+    selectedDay,
+    loading,
+    error,
+    region,
+    isLive,
+    userLocation,
+    locationRequested,
+    setZones,
+    setNearbyZones,
+    selectZone,
+    clearSelection,
+    setSelectedDay,
+    setLoading,
+    setError,
+    setIsLive,
+    setUserLocation,
+    setLocationRequested,
+    setRegion,
+  } = useHeatwaveStore();
 
-  const load = useCallback(async () => {
+  const { width: screenWidth } = useWindowDimensions();
+  const isDesktop = screenWidth >= 1024;
+  const hasAutoSelected = useRef(false);
+
+  // ─── Step 1: Request user geolocation on mount ───
+  useEffect(() => {
+    if (locationRequested) return;
+    setLocationRequested(true);
+
+    if (typeof navigator === 'undefined' || !navigator.geolocation) {
+      console.log('[Geo] Geolocation not supported');
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const loc = {
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+          accuracy: position.coords.accuracy,
+        };
+        console.log(`[Geo] ✅ User location: ${loc.latitude.toFixed(4)}°N, ${loc.longitude.toFixed(4)}°E`);
+        setUserLocation(loc);
+
+        // Update map region to center on user
+        setRegion({
+          latitude: loc.latitude,
+          longitude: loc.longitude,
+          latitudeDelta: 2.0,
+          longitudeDelta: 2.0,
+        });
+      },
+      (err) => {
+        console.warn('[Geo] ❌ Location denied or failed:', err.message);
+        // Continue with default Thailand region
+      },
+      {
+        enableHighAccuracy: false,
+        timeout: 10000,
+        maximumAge: 60000,
+      },
+    );
+  }, [locationRequested, setUserLocation, setLocationRequested, setRegion]);
+
+  // ─── Step 2: Filter zones by proximity to user ───
+  useEffect(() => {
+    if (!userLocation || zones.length === 0) {
+      setNearbyZones(zones);
+      return;
+    }
+
+    const filtered = zones.filter((zone) => {
+      const center = getPolygonCenter(zone.geometry.coordinates[0]);
+      const dist = degreeDistance(
+        userLocation.latitude, userLocation.longitude,
+        center.lat, center.lon,
+      );
+      return dist <= PROXIMITY_RADIUS;
+    });
+
+    console.log(
+      `[HeatWave] Filtered ${zones.length} zones → ${filtered.length} nearby (within ${PROXIMITY_RADIUS}° of user)`,
+    );
+
+    setNearbyZones(filtered.length > 0 ? filtered : zones.slice(0, 50));
+  }, [zones, userLocation, setNearbyZones]);
+
+  // ─── Step 3: Auto-select the closest zone to user ───
+  useEffect(() => {
+    if (hasAutoSelected.current || !userLocation || nearbyZones.length === 0) return;
+    hasAutoSelected.current = true;
+
+    // Find the zone closest to the user
+    let closestZone: HeatZone | null = null;
+    let closestDist = Infinity;
+
+    nearbyZones.forEach((zone) => {
+      const center = getPolygonCenter(zone.geometry.coordinates[0]);
+      const dist = degreeDistance(
+        userLocation.latitude, userLocation.longitude,
+        center.lat, center.lon,
+      );
+      if (dist < closestDist) {
+        closestDist = dist;
+        closestZone = zone;
+      }
+    });
+
+    if (closestZone) {
+      console.log(
+        `[HeatWave] Auto-selected closest zone: "${(closestZone as HeatZone).properties.name}" (${closestDist.toFixed(3)}° away)`,
+      );
+      // Small delay so the map animates first
+      setTimeout(() => selectZone(closestZone!), 1500);
+    }
+  }, [nearbyZones, userLocation, selectZone]);
+
+  // ─── Load heat zones for the selected day ───
+  const loadZones = useCallback(async (dayOffset: number) => {
+    setLoading(true);
+    setError(null);
     try {
-      const [pred, fcast] = await Promise.all([
-        fetchPrediction(),
-        fetchForecast(7).catch(() => null),
-      ]);
-      setPrediction(pred);
-      setForecast(fcast);
+      const date = new Date();
+      date.setDate(date.getDate() + dayOffset);
+      const dateStr = date.toISOString().split('T')[0];
+
+      const result = await fetchHeatZones(dateStr, dayOffset);
+      setZones(result.zones);
+      setIsLive(result.isLive);
     } catch (e) {
-      console.error('Failed to load data:', e);
+      const msg = e instanceof Error ? e.message : 'Failed to load data';
+      setError(msg);
+      console.error('[Dashboard] Load failed:', e);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [setZones, setLoading, setError, setIsLive]);
 
-  useEffect(() => { load(); }, [load]);
+  // Initial load
+  useEffect(() => {
+    loadZones(0);
+  }, [loadZones]);
 
-  // Build timeline days
-  const timelineDays: TimelineDay[] = useMemo(() => {
-    const days: TimelineDay[] = [];
+  // Handle day change
+  const handleDayChange = useCallback(
+    (day: number) => {
+      setSelectedDay(day);
+      clearSelection();
+      hasAutoSelected.current = false;
+      loadZones(day);
+    },
+    [setSelectedDay, clearSelection, loadZones],
+  );
 
-    if (prediction) {
-      days.push({
-        label: 'Now',
-        date: prediction.date,
-        riskLevel: prediction.risk_level,
-        hasData: true,
-      });
-    } else {
-      days.push({
-        label: 'Now',
-        date: new Date().toISOString().split('T')[0],
-        riskLevel: 'LOW',
-        hasData: false,
-      });
-    }
+  // Handle zone press
+  const handleZonePress = useCallback(
+    (zone: HeatZone) => {
+      selectZone(zone);
+    },
+    [selectZone],
+  );
 
-    if (forecast?.forecasts) {
-      forecast.forecasts.forEach((f, i) => {
-        days.push({
-          label: `+${i + 1}d`,
-          date: f.date,
-          riskLevel: (f.risk_label || f.risk_level) as RiskLevel,
-          hasData: true,
-        });
-      });
-    } else {
-      for (let i = 1; i <= 7; i++) {
-        const d = new Date();
-        d.setDate(d.getDate() + i);
-        days.push({
-          label: `+${i}d`,
-          date: d.toISOString().split('T')[0],
-          riskLevel: 'LOW',
-          hasData: false,
-        });
-      }
-    }
-    return days;
-  }, [prediction, forecast]);
+  // Handle close alert
+  const handleCloseAlert = useCallback(() => {
+    clearSelection();
+  }, [clearSelection]);
 
-  // Current day data
-  const currentDayData: DayData | null = useMemo(() => {
-    if (selectedDay === 0 && prediction) {
-      return {
-        riskLevel: prediction.risk_level,
-        probability: prediction.probability,
-        advice: prediction.advice,
-        weather: prediction.weather,
-        date: prediction.date,
-        bbox: prediction.bbox || DEFAULT_BBOX,
-      };
-    }
-    if (selectedDay > 0 && forecast?.forecasts) {
-      const f = forecast.forecasts[selectedDay - 1];
-      if (f) return {
-        riskLevel: (f.risk_label || f.risk_level) as RiskLevel,
-        probability: f.probability,
-        advice: f.advice || '',
-        weather: f.weather as any,
-        date: f.date,
-        bbox: DEFAULT_BBOX,
-      };
-    }
-    return null;
-  }, [selectedDay, prediction, forecast]);
+  // Zones to display — use nearbyZones (filtered) instead of all zones
+  const displayZones = nearbyZones;
 
-  const dayHasData = timelineDays[selectedDay]?.hasData ?? false;
-
-  if (loading) {
+  // Error state
+  if (error && zones.length === 0) {
     return (
-      <View style={[styles.fullScreen, { backgroundColor: '#0f0f1a' }]}>
-        <ActivityIndicator size="large" color={theme.tint} />
-        <Text style={styles.loadingText}>Loading heatwave data…</Text>
+      <View style={styles.centerScreen}>
+        <Text style={styles.errorIcon}>⚠️</Text>
+        <Text style={styles.errorText}>{error}</Text>
+        <Text style={styles.errorHint}>Pull to refresh or check API connection</Text>
       </View>
     );
   }
 
-  const riskColor = currentDayData
-    ? (RiskColors[currentDayData.riskLevel] || RiskColors.LOW)
-    : RiskColors.LOW;
-
   return (
     <View style={styles.fullScreen}>
-      {/* ═══ LAYER 0: Background Map ═══ */}
-      {currentDayData ? (
-        <HeatwaveMap
-          riskLevel={currentDayData.riskLevel}
-          bbox={currentDayData.bbox}
-          probability={currentDayData.probability}
-          advice={currentDayData.advice}
-          weather={currentDayData.weather}
-          date={currentDayData.date}
-          isFullScreen
-        />
-      ) : (
-        <View style={[styles.fullScreen, { backgroundColor: '#0f0f1a' }]} />
+      {/* ═══ LAYER 0: Map ═══ */}
+      <HeatMap
+        zones={displayZones}
+        region={region}
+        onZonePress={handleZonePress}
+        userLocation={userLocation}
+      />
+
+      {/* ═══ LAYER 1: Loading overlay ═══ */}
+      {loading && (
+        <View style={styles.loadingOverlay}>
+          <ActivityIndicator size="large" color="#10B981" />
+          <Text style={styles.loadingText}>
+            {userLocation
+              ? 'Loading nearby heat zones…'
+              : 'Loading heat zones…'}
+          </Text>
+        </View>
       )}
 
-      {/* ═══ LAYER 1: Top — Header + Timeline ═══ */}
-      <View style={[styles.topOverlay, { pointerEvents: 'box-none' }]}>
-        {/* Mini Header */}
+      {/* ═══ LAYER 2: Top — Header + TimeSlider ═══ */}
+      <View style={styles.topOverlay} pointerEvents="box-none">
+        {/* Mini header */}
         <View style={styles.header}>
-          <Text style={styles.titleText}>Heatwave</Text>
-          <View style={[
-            styles.liveBadge,
-            { backgroundColor: getUseMockData() ? 'rgba(245,158,11,0.15)' : 'rgba(16,185,129,0.15)' },
-          ]}>
-            <View style={{
-              width: 5, height: 5, borderRadius: 3,
-              backgroundColor: getUseMockData() ? '#F59E0B' : '#10B981',
-            }} />
-            <Text style={{
-              fontSize: 10, fontWeight: '700',
-              color: getUseMockData() ? '#FCD34D' : '#6EE7B7',
-            }}>
-              {getUseMockData() ? 'MOCK' : 'LIVE'}
-            </Text>
+          <View style={styles.headerLeft}>
+            <Text style={styles.titleText}>🔥 Heat Wave</Text>
+          </View>
+          <View style={styles.headerRight}>
+            {/* Location badge */}
+            {userLocation && (
+              <View style={styles.locationBadge}>
+                <Text style={styles.locationBadgeText}>
+                  📍 {userLocation.latitude.toFixed(2)}°N
+                </Text>
+              </View>
+            )}
+            <View style={styles.zoneBadge}>
+              <Text style={styles.zoneBadgeText}>
+                {displayZones.length} zones
+              </Text>
+            </View>
           </View>
         </View>
 
-        {/* Timeline */}
-        <TimelineBar
-          days={timelineDays}
-          selectedIndex={selectedDay}
-          onSelectDay={setSelectedDay}
+        {/* TimeSlider */}
+        <TimeSlider
+          selectedDay={selectedDay}
+          onSelectDay={handleDayChange}
         />
       </View>
 
-      {/* ═══ LAYER 2: Top-Right — Legend ═══ */}
-      <View style={styles.legendContainer}>
-        {(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] as const).map((level) => {
-          const c = RiskColors[level];
-          const isCurrentLevel = currentDayData?.riskLevel === level;
-          return (
-            <View key={level} style={styles.legendItem}>
-              <View style={[
-                styles.legendDot,
-                { backgroundColor: c.primary },
-                isCurrentLevel && { width: 10, height: 10, borderRadius: 5 },
-              ]} />
-              <Text style={[
-                styles.legendLabel,
-                isCurrentLevel && { color: '#fff', fontWeight: '700' },
-              ]}>
-                {level}
-              </Text>
-            </View>
-          );
-        })}
+      {/* ═══ LAYER 3: Legend ═══ */}
+      <View
+        style={[
+          styles.legendContainer,
+          isDesktop && styles.legendDesktop,
+        ]}
+        pointerEvents="box-none"
+      >
+        <Legend zones={displayZones} isLive={isLive} />
       </View>
 
-      {/* ═══ LAYER 3: Bottom-Left — Compact Info Card ═══ */}
-      <View style={[styles.bottomOverlay, { pointerEvents: 'box-none' }]}>
-        {!dayHasData ? (
-          <View style={styles.noDataCard}>
-            <Text style={styles.noDataText}>No prediction data</Text>
-          </View>
-        ) : currentDayData ? (
-          <View style={[styles.infoCard, { borderLeftColor: riskColor.primary }]}>
-            {/* Row 1: Badge + Probability */}
-            <View style={styles.cardRow1}>
-              <View style={[styles.riskBadge, { backgroundColor: riskColor.primary }]}>
-                <Text style={styles.riskBadgeText}>{currentDayData.riskLevel}</Text>
-              </View>
-              <Text style={styles.cardDot}> · </Text>
-              <Text style={[styles.probText, { color: riskColor.primary }]}>
-                {(currentDayData.probability * 100).toFixed(0)}%
-              </Text>
-            </View>
-            {/* Row 2: Quick metrics */}
-            <View style={styles.cardRow2}>
-              {currentDayData.weather?.T2M_MAX != null && (
-                <Text style={styles.miniMetric}>🌡️{currentDayData.weather.T2M_MAX.toFixed(1)}°</Text>
-              )}
-              {currentDayData.weather?.RH2M != null && (
-                <Text style={styles.miniMetric}>💧{currentDayData.weather.RH2M.toFixed(0)}%</Text>
-              )}
-              {currentDayData.weather?.WS10M != null && (
-                <Text style={styles.miniMetric}>💨{currentDayData.weather.WS10M.toFixed(1)}m/s</Text>
-              )}
-            </View>
-          </View>
-        ) : null}
-      </View>
+      {/* ═══ LAYER 4: AlertCard bottom sheet ═══ */}
+      <AlertCard zone={selectedZone} onClose={handleCloseAlert} />
     </View>
   );
 }
@@ -253,151 +304,123 @@ export default function DashboardScreen() {
 const styles = StyleSheet.create({
   fullScreen: {
     flex: 1,
+    position: 'relative' as const,
+    backgroundColor: '#000000',
+  },
+  centerScreen: {
+    flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    position: 'relative' as any,
+    backgroundColor: '#000000',
+    padding: 24,
+  },
+
+  // Loading
+  loadingOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    zIndex: 50,
   },
   loadingText: {
     marginTop: 12,
     fontSize: 13,
     color: '#6b7280',
+    fontWeight: '500',
   },
 
-  /* ─── Top ─── */
+  // Error
+  errorIcon: {
+    fontSize: 48,
+    marginBottom: 16,
+  },
+  errorText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#EF4444',
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  errorHint: {
+    fontSize: 13,
+    color: '#6b7280',
+    textAlign: 'center',
+  },
+
+  // Top overlay
   topOverlay: {
-    position: 'absolute' as any,
-    top: 0, left: 0, right: 0,
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
     zIndex: 100,
-    paddingTop: Platform.OS === 'web' ? 12 : 50,
+    paddingTop: Platform.OS === 'web' ? 16 : 52,
   },
   header: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingBottom: 8,
+    paddingHorizontal: 20,
+    paddingBottom: 10,
   },
-  titleText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: 'rgba(255, 255, 255, 0.6)',
-    letterSpacing: -0.3,
-    ...({
-      textShadow: '0 1px 3px rgba(0,0,0,0.6)',
-    } as any),
-  },
-  liveBadge: {
+  headerLeft: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 5,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 12,
-  },
-
-  /* ─── Legend (top-right) ─── */
-  legendContainer: {
-    position: 'absolute' as any,
-    top: Platform.OS === 'web' ? 100 : 140,
-    right: 12,
-    zIndex: 100,
-    backgroundColor: 'rgba(15, 15, 26, 0.7)',
-    borderRadius: 10,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    gap: 5,
-    ...({
-      backdropFilter: 'blur(10px)',
-      WebkitBackdropFilter: 'blur(10px)',
-    } as any),
-  },
-  legendItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  legendDot: {
-    width: 7,
-    height: 7,
-    borderRadius: 4,
-  },
-  legendLabel: {
-    fontSize: 9,
-    color: 'rgba(255, 255, 255, 0.5)',
-    fontWeight: '600',
-    letterSpacing: 0.3,
-    textTransform: 'uppercase',
-  },
-
-  /* ─── Bottom-left compact card ─── */
-  bottomOverlay: {
-    position: 'absolute' as any,
-    bottom: 72,
-    left: 12,
-    zIndex: 100,
-    maxWidth: 220,
-  },
-  infoCard: {
-    backgroundColor: 'rgba(15, 15, 26, 0.75)',
-    borderRadius: 14,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderLeftWidth: 3,
-    ...({
-      backdropFilter: 'blur(16px)',
-      WebkitBackdropFilter: 'blur(16px)',
-    } as any),
-  },
-  cardRow1: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 4,
-  },
-  riskBadge: {
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    borderRadius: 4,
-  },
-  riskBadgeText: {
-    color: '#FFFFFF',
-    fontSize: 9,
-    fontWeight: '800',
-    letterSpacing: 0.8,
-  },
-  cardDot: {
-    color: 'rgba(255,255,255,0.3)',
-    fontSize: 14,
-    fontWeight: '300',
-  },
-  probText: {
-    fontSize: 20,
-    fontWeight: '800',
-    letterSpacing: -1,
-  },
-  cardRow2: {
-    flexDirection: 'row',
     gap: 8,
   },
-  miniMetric: {
+  headerRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  titleText: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#ffffff',
+    letterSpacing: -0.5,
+    ...({
+      textShadow: '0 2px 8px rgba(0,0,0,0.6)',
+    } as Record<string, string>),
+  },
+  locationBadge: {
+    backgroundColor: 'rgba(59, 130, 246, 0.2)',
+    borderWidth: 1,
+    borderColor: 'rgba(59, 130, 246, 0.3)',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 10,
+  },
+  locationBadgeText: {
     fontSize: 11,
+    fontWeight: '700',
+    color: '#93C5FD',
+  },
+  zoneBadge: {
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 10,
+  },
+  zoneBadgeText: {
+    fontSize: 11,
+    fontWeight: '700',
     color: 'rgba(255, 255, 255, 0.6)',
-    fontWeight: '500',
   },
 
-  /* ─── No Data ─── */
-  noDataCard: {
-    backgroundColor: 'rgba(15, 15, 26, 0.7)',
-    borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    ...({
-      backdropFilter: 'blur(12px)',
-      WebkitBackdropFilter: 'blur(12px)',
-    } as any),
+  // Legend
+  legendContainer: {
+    position: 'absolute',
+    bottom: 90,
+    left: 16,
+    zIndex: 100,
   },
-  noDataText: {
-    color: 'rgba(255, 255, 255, 0.5)',
-    fontSize: 12,
-    fontWeight: '600',
+  legendDesktop: {
+    bottom: 24,
+    left: 24,
   },
 });
